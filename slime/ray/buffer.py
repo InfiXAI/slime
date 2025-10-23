@@ -121,6 +121,72 @@ class RolloutController:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
+        filtered_samples: list[Sample] = []
+        filtered_raw_rewards: list[float] = []
+        filtered_rewards: list[float] = []
+        filtered_dataset_indices: list[int | None] = []
+        dropped = 0
+
+        for sample, raw_reward, reward in zip(samples, raw_rewards, rewards):
+            response_len = int(sample.response_length)
+
+            if response_len <= 0:
+                dropped += 1
+                continue
+
+            if sample.loss_mask is None:
+                sample.loss_mask = [1] * response_len
+
+            if len(sample.loss_mask) != response_len:
+                if len(sample.loss_mask) > response_len and response_len > 0:
+                    sample.loss_mask = sample.loss_mask[:response_len]
+                else:
+                    dropped += 1
+                    continue
+
+            idx = None
+            if sample.metadata and isinstance(sample.metadata, dict):
+                value = sample.metadata.get("dataset_index")
+                if isinstance(value, int):
+                    idx = value
+
+            filtered_samples.append(sample)
+            filtered_raw_rewards.append(raw_reward)
+            filtered_rewards.append(reward)
+            filtered_dataset_indices.append(idx)
+
+        if dropped > 0:
+            print(
+                f"[RolloutController] Dropped {dropped} invalid samples "
+                "(response_length<=0 or mismatched loss_mask)."
+            )
+
+        if not filtered_samples:
+            raise RuntimeError("No valid samples remained after filtering invalid rollout entries.")
+
+        samples = filtered_samples
+        raw_rewards = filtered_raw_rewards
+        rewards = filtered_rewards
+        dataset_indices = filtered_dataset_indices
+
+        global_bs = getattr(self.args, "global_batch_size", None)
+        if global_bs:
+            valid_len = len(samples)
+            trimmed_len = (valid_len // global_bs) * global_bs
+            if trimmed_len == 0:
+                raise RuntimeError(
+                    f"Filtered rollout batch ({valid_len} samples) smaller than global batch size {global_bs}."
+                )
+            if trimmed_len != valid_len:
+                drop_tail = valid_len - trimmed_len
+                print(
+                    f"[RolloutController] Trimmed {drop_tail} samples to keep batch size divisible by global_batch_size ({global_bs})."
+                )
+                samples = samples[:trimmed_len]
+                raw_rewards = raw_rewards[:trimmed_len]
+                rewards = rewards[:trimmed_len]
+                dataset_indices = dataset_indices[:trimmed_len]
+
         train_data = {
             "tokens": [sample.tokens for sample in samples],
             "response_lengths": [sample.response_length for sample in samples],
@@ -129,7 +195,9 @@ class RolloutController:
             "rewards": rewards,
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
-            "sample_indices": [sample.index for sample in samples],
+            "sample_indices": [
+                dataset_indices[i] if dataset_indices[i] is not None else samples[i].index for i in range(len(samples))
+            ],
         }
 
         # loss mask

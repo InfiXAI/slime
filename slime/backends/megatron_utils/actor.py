@@ -25,6 +25,7 @@ from .data import get_data_iterator, log_perf_data, log_rollout_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .polaris_integration import apply_polaris_to_rollout_data, init_polaris_components, log_polaris_stats
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
 
 
@@ -107,6 +108,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 with_flops=True,
             )
             self.prof.start()
+
+        # POLARIS components initialization
+        self.reward_tracker, self.dynamic_replacer = init_polaris_components(args)
 
         Timer().start("train_wait")
         return start_rollout_id
@@ -231,6 +235,25 @@ class MegatronTrainRayActor(TrainRayActor):
             with timer("data_preprocess"):
                 rollout_data = self._get_rollout_data(rollout_data_ref)
 
+                # POLARIS: Apply dynamic sampling and reward tracking
+                # This should be done before computing advantages_and_returns
+                polaris_stats = {}
+                if self.args.enable_polaris_dynamic_sampling or self.args.enable_polaris_reward_tracking:
+                    with timer("polaris_processing"):
+                        rollout_data, polaris_stats = apply_polaris_to_rollout_data(
+                            self.args,
+                            rollout_data,
+                            rollout_id,
+                            self.reward_tracker,
+                            self.dynamic_replacer,
+                        )
+
+                        # If configured to skip batch when insufficient good samples (verl behavior)
+                        if polaris_stats.get("polaris/skip_batch_due_to_insufficient_good", 0) == 1:
+                            print("[POLARIS] Skip this batch due to insufficient medium-difficulty samples.")
+                            Timer().start("train_wait")
+                            return
+
                 # Create data iterator for log_probs and train.
                 data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
@@ -265,6 +288,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.rollout_data_postprocess(self.args)
 
             log_rollout_data(rollout_id, self.args, rollout_data)
+
+            # Log POLARIS statistics
+            if polaris_stats:
+                log_polaris_stats(rollout_id, self.args, polaris_stats)
 
             if self.args.use_pytorch_profiler and torch.distributed.get_rank() == 0 and self.prof is not None:
                 self.prof.step()
